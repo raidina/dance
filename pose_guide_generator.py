@@ -98,26 +98,24 @@ def detect_key_poses(
     min_hold_frames: int = 3,
     max_poses: int = 20,
     verbose: bool = True,
+    mode: str = "hold",
 ) -> List[dict]:
     """
-    ตรวจจับท่าที่ "หยุดนิ่ง" ในวิดีโอ
-
-    วิธีทำงาน:
-    - คำนวณ movement = ระยะที่ keypoints เคลื่อนที่ระหว่าง frame
-    - ถ้า movement ต่ำกว่า threshold ติดต่อกัน min_hold_frames → ถือว่า "หยุดนิ่ง"
-    - เก็บ frame ที่ movement น้อยที่สุดในแต่ละช่วง
+    ตรวจจับท่าจากวิดีโอ
 
     Args:
         video_path: path ของวิดีโอ
         person_index: ลำดับคนที่ต้องการ (None = คนเดียว)
         sample_fps: fps ที่จะ sample
-        motion_threshold: ค่า movement ขั้นต่ำที่ถือว่า "หยุด" (0-1)
-        min_hold_frames: จำนวน frame ขั้นต่ำที่ต้องหยุดนิ่ง
+        motion_threshold: threshold movement (0-1)
+        min_hold_frames: จำนวน frame ขั้นต่ำที่ต้องหยุดนิ่ง (mode=hold)
         max_poses: จำนวนท่าสูงสุดที่จะดึงออกมา
         verbose: แสดง progress
+        mode: 'hold' = เลือกเฟรมที่หยุดนิ่ง (default)
+              'motion' = เลือกเฟรมที่มีการขยับสูงสุด
 
     Returns:
-        list of dict: {'frame_idx', 'timestamp', 'keypoints', 'movement_score'}
+        list of dict: {'frame_idx', 'timestamp', 'keypoints', 'movement'}
     """
     tracker = PersonTracker(target_person_index=person_index) if person_index is not None else None
 
@@ -183,6 +181,7 @@ def detect_key_poses(
                     "frame_idx": frame_count,
                     "timestamp": timestamp,
                     "keypoints": kps_norm,
+                    "raw_keypoints": kps,  # ตำแหน่งจริง 0-1 ของ MediaPipe
                 })
 
             if pbar:
@@ -206,53 +205,120 @@ def detect_key_poses(
         all_frames[i]["movement"] = movement
     all_frames[0]["movement"] = all_frames[1]["movement"]
 
-    # หา "hold segments" — ช่วงที่ movement ต่ำติดต่อกัน
-    hold_segments = []
-    in_hold = False
-    hold_start = 0
+    # ============================================================
+    # MODE: hold — เลือกเฟรมที่หยุดนิ่ง (movement ต่ำ)
+    # ============================================================
+    if mode == "hold":
+        hold_segments = []
+        in_hold = False
+        hold_start = 0
 
-    for i, f in enumerate(all_frames):
-        if f["movement"] < motion_threshold:
-            if not in_hold:
-                in_hold = True
-                hold_start = i
-        else:
-            if in_hold and (i - hold_start) >= min_hold_frames:
-                hold_segments.append((hold_start, i - 1))
-            in_hold = False
+        for i, f in enumerate(all_frames):
+            if f["movement"] < motion_threshold:
+                if not in_hold:
+                    in_hold = True
+                    hold_start = i
+            else:
+                if in_hold and (i - hold_start) >= min_hold_frames:
+                    hold_segments.append((hold_start, i - 1))
+                in_hold = False
 
-    if in_hold and (len(all_frames) - hold_start) >= min_hold_frames:
-        hold_segments.append((hold_start, len(all_frames) - 1))
+        if in_hold and (len(all_frames) - hold_start) >= min_hold_frames:
+            hold_segments.append((hold_start, len(all_frames) - 1))
 
-    if verbose:
-        print(f"  พบ {len(hold_segments)} ช่วงที่หยุดนิ่ง")
-
-    # เลือก frame ที่ movement น้อยที่สุดในแต่ละ segment
-    key_poses = []
-    for start, end in hold_segments:
-        segment = all_frames[start:end + 1]
-        best = min(segment, key=lambda f: f["movement"])
-        key_poses.append(best)
-
-    # ถ้าหา hold segment ไม่เจอพอ ให้ sample จาก low-movement frames แทน
-    if len(key_poses) < 5:
         if verbose:
-            print(f"  ⚠️ hold segment น้อย ({len(key_poses)}) — เพิ่มด้วย low-movement sampling")
-        sorted_frames = sorted(all_frames[1:], key=lambda f: f["movement"])
-        added = set(f["frame_idx"] for f in key_poses)
-        for f in sorted_frames:
-            if f["frame_idx"] not in added:
-                key_poses.append(f)
-                added.add(f["frame_idx"])
-            if len(key_poses) >= max_poses:
-                break
+            print(f"  พบ {len(hold_segments)} ช่วงที่หยุดนิ่ง")
+
+        key_poses = []
+        for start, end in hold_segments:
+            segment = all_frames[start:end + 1]
+            best = min(segment, key=lambda f: f["movement"])
+            key_poses.append(best)
+
+        # fallback ถ้าหา hold ไม่เจอพอ
+        if len(key_poses) < 5:
+            if verbose:
+                print(f"  ⚠️ hold segment น้อย ({len(key_poses)}) — เพิ่มด้วย low-movement sampling")
+            sorted_frames = sorted(all_frames[1:], key=lambda f: f["movement"])
+            added = set(f["frame_idx"] for f in key_poses)
+            for f in sorted_frames:
+                if f["frame_idx"] not in added:
+                    key_poses.append(f)
+                    added.add(f["frame_idx"])
+                if len(key_poses) >= max_poses:
+                    break
+
+    # ============================================================
+    # MODE: motion — เลือกเฟรมที่มีการขยับสูงสุด
+    # ============================================================
+    elif mode == "motion":
+        # หาช่วงที่ movement สูงต่อเนื่อง (motion burst segments)
+        motion_segments = []
+        in_motion = False
+        motion_start = 0
+
+        for i, f in enumerate(all_frames):
+            if f["movement"] > motion_threshold:
+                if not in_motion:
+                    in_motion = True
+                    motion_start = i
+            else:
+                if in_motion:
+                    motion_segments.append((motion_start, i - 1))
+                in_motion = False
+
+        if in_motion:
+            motion_segments.append((motion_start, len(all_frames) - 1))
+
+        if verbose:
+            print(f"  พบ {len(motion_segments)} ช่วงที่มีการขยับ")
+
+        key_poses = []
+        for start, end in motion_segments:
+            segment = all_frames[start:end + 1]
+            # เลือก frame ที่ movement สูงสุดในแต่ละ burst
+            best = max(segment, key=lambda f: f["movement"])
+            key_poses.append(best)
+
+        # ถ้าน้อยเกินไป เพิ่มจาก high-movement frames
+        if len(key_poses) < 5:
+            if verbose:
+                print(f"  ⚠️ motion segment น้อย — เพิ่มด้วย high-movement sampling")
+            sorted_frames = sorted(all_frames[1:], key=lambda f: f["movement"], reverse=True)
+            added = set(f["frame_idx"] for f in key_poses)
+            for f in sorted_frames:
+                if f["frame_idx"] not in added:
+                    key_poses.append(f)
+                    added.add(f["frame_idx"])
+                if len(key_poses) >= max_poses:
+                    break
+
+    # ============================================================
+    # MODE: filmstrip — sample ทุก interval_sec วินาที
+    # ============================================================
+    elif mode == "filmstrip":
+        key_poses = []
+        if len(all_frames) == 0:
+            pass
+        else:
+            # หา interval เป็นจำนวน all_frames index
+            # all_frames ถูก sample ที่ sample_fps แล้ว
+            # interval_sec ถูกส่งมาผ่าน motion_threshold ชั่วคราว (reuse param)
+            # แต่เราจะใช้ sample_fps เพื่อคำนวณ
+            step = max(1, round(sample_fps * 0.5))  # 0.5 วินาที
+            for i in range(0, len(all_frames), step):
+                key_poses.append(all_frames[i])
+
+    else:
+        raise ValueError(f"mode ต้องเป็น 'hold', 'motion', หรือ 'filmstrip' เท่านั้น ได้รับ: {mode!r}")
 
     # เรียงตาม timestamp และจำกัดจำนวน
     key_poses.sort(key=lambda f: f["timestamp"])
     key_poses = key_poses[:max_poses]
 
     if verbose:
-        print(f"  ✓ เลือกได้ {len(key_poses)} ท่าหลัก")
+        mode_label = {"hold": "ท่าหยุดนิ่ง", "motion": "ท่าขยับ", "filmstrip": "ท่าต่อเนื่อง"}.get(mode, "ท่า")
+        print(f"  ✓ เลือกได้ {len(key_poses)} {mode_label}")
 
     return key_poses
 
@@ -267,16 +333,18 @@ def draw_skeleton_on_frame(
     line_thickness: int = 3,
     circle_radius: int = 6,
     alpha: float = 0.85,
+    raw_keypoints: np.ndarray = None,
 ) -> np.ndarray:
     """
-    วาด skeleton บนภาพจริงจากวิดีโอ โดยแปลง normalized coords กลับเป็น pixel
+    วาด skeleton บนภาพจริงจากวิดีโอ
 
     Args:
         frame: ภาพ BGR จากวิดีโอ
-        keypoints_normalized: normalized keypoints (N, 2)
+        keypoints_normalized: normalized keypoints (N, 2) — ใช้ fallback เท่านั้น
         line_thickness: ความหนาของเส้น
         circle_radius: ขนาดจุด joint
         alpha: ความโปร่งใสของ skeleton overlay (0-1)
+        raw_keypoints: ตำแหน่งจริง 0-1 จาก MediaPipe (แนะนำให้ส่งมาเสมอ)
 
     Returns:
         frame ที่มี skeleton วาดทับ
@@ -284,20 +352,23 @@ def draw_skeleton_on_frame(
     h, w = frame.shape[:2]
     overlay = frame.copy()
 
-    # แปลง normalized → pixel โดยประมาณตำแหน่งจากสัดส่วนของภาพ
-    # ใช้ hip center = 55% จากบน, shoulder width = ~20% ของ width
-    hip_cx = w * 0.50
-    hip_cy = h * 0.60
-    scale  = w * 0.18
-
-    def to_pixel(kp):
-        px = int(hip_cx + kp[0] * scale)
-        py = int(hip_cy + kp[1] * scale)
-        px = max(0, min(w - 1, px))
-        py = max(0, min(h - 1, py))
-        return (px, py)
-
-    pts = [to_pixel(kp) for kp in keypoints_normalized]
+    if raw_keypoints is not None:
+        # ใช้ตำแหน่งจริงจาก MediaPipe (0-1 range) → pixel
+        def to_pixel(kp):
+            px = int(kp[0] * w)
+            py = int(kp[1] * h)
+            return (max(0, min(w - 1, px)), max(0, min(h - 1, py)))
+        pts = [to_pixel(kp) for kp in raw_keypoints]
+    else:
+        # fallback: ประมาณจาก normalized keypoints
+        hip_cx = w * 0.50
+        hip_cy = h * 0.60
+        scale  = w * 0.15
+        def to_pixel(kp):
+            px = int(hip_cx + kp[0] * scale)
+            py = int(hip_cy + kp[1] * scale)
+            return (max(0, min(w - 1, px)), max(0, min(h - 1, py)))
+        pts = [to_pixel(kp) for kp in keypoints_normalized]
 
     # วาด connections
     for idx, (i, j) in enumerate(SKELETON_CONNECTIONS):
@@ -359,8 +430,12 @@ def prepare_pose_images(
         x_off = (tw - new_w) // 2
         canvas[y_off:y_off + new_h, x_off:x_off + new_w] = frame_resized
 
-        # วาด skeleton
-        result = draw_skeleton_on_frame(canvas, pose["keypoints"])
+        # วาด skeleton (ใช้ raw_keypoints ถ้ามี เพื่อตำแหน่งที่ถูกต้อง)
+        result = draw_skeleton_on_frame(
+            canvas,
+            pose["keypoints"],
+            raw_keypoints=pose.get("raw_keypoints"),
+        )
         images.append(result)
 
     return images
@@ -551,10 +626,11 @@ def generate_dance_guide(
     video_path: str,
     output_path: str = "results/dance_guide.pdf",
     person_index: Optional[int] = None,
-    max_poses: int = 16,
+    max_poses: int = 32,
     poses_per_row: int = 2,
     song_name: str = "",
     motion_threshold: float = 0.03,
+    mode: str = "hold",
 ) -> str:
     """
     ฟังก์ชันหลัก — รันทุกอย่างในครั้งเดียว
@@ -566,7 +642,8 @@ def generate_dance_guide(
         max_poses: จำนวนท่าสูงสุด
         poses_per_row: จำนวนท่าต่อแถวใน PDF
         song_name: ชื่อเพลง/ศิลปิน แสดงในหน้าปก
-        motion_threshold: ความ sensitive ในการตรวจจับท่าหยุด
+        motion_threshold: ความ sensitive ในการตรวจจับท่า
+        mode: 'hold' = ท่าหยุดนิ่ง | 'motion' = ท่าขยับ | 'filmstrip' = ทุก 0.5 วินาที
 
     Returns:
         path ของ PDF ที่สร้าง
@@ -582,6 +659,7 @@ def generate_dance_guide(
         person_index=person_index,
         motion_threshold=motion_threshold,
         max_poses=max_poses,
+        mode=mode,
     )
 
     # 2. เตรียมภาพ
