@@ -1,0 +1,30 @@
+# Model files (ดาวน์โหลดอัตโนมัติ)
+*.pt
+*.task
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+results/reference_videos/
+
+# Generated outputs
+results/pose_cache/
+results/labeled_preview.mp4
+results/preview_person*.mp4
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Virtual environment
+venv/
+
+# macOS
+.DS_Store
+
+# Large data files
+*.json

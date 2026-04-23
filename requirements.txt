@@ -1,0 +1,13 @@
+mediapipe>=0.10.0
+opencv-python>=4.8.0
+yt-dlp>=2024.1.0
+fastdtw>=0.3.4
+scipy>=1.11.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+Pillow>=10.0.0
+ipywidgets>=8.0.0
+jupyter>=1.0.0
+reportlab>=4.0.0
+ultralytics>=8.0.0
