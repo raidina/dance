@@ -15,6 +15,8 @@ from scipy.spatial.distance import cosine
 from scipy.signal import savgol_filter
 from tqdm import tqdm
 from typing import Optional
+import subprocess
+import tempfile
 
 from reference_processor import (
     extract_pose_from_video,
@@ -24,6 +26,21 @@ from reference_processor import (
     DANCE_KEYPOINTS,
     KEYPOINT_NAMES,
 )
+try:
+    from pose_classifier import AnomalyDetector as _AnomalyDetector
+    _CLF_AVAILABLE = True
+except Exception:
+    _AnomalyDetector = None
+    _CLF_AVAILABLE = False
+
+# lazy singleton
+_pf_clf = None
+
+def _get_pf_classifier(sample_fps: float = 10.0):
+    global _pf_clf
+    if not _CLF_AVAILABLE: return None
+    if _pf_clf is None: _pf_clf = _AnomalyDetector(sample_fps=sample_fps)
+    return _pf_clf
 
 
 # ========== Similarity Functions ==========
@@ -51,8 +68,7 @@ def compute_frame_similarity(kp1: np.ndarray, kp2: np.ndarray) -> float:
 
 def align_sequences_dtw(seq1: list, seq2: list) -> tuple:
     """
-    จัดเรียง sequence สอง ชุดด้วย Dynamic Time Warping
-    เพื่อรับมือกับความเร็วในการเต้นที่ต่างกัน
+    จัดเรียง sequence สองชุดด้วย Dynamic Time Warping
 
     Args:
         seq1: list of keypoints arrays (reference)
@@ -63,7 +79,6 @@ def align_sequences_dtw(seq1: list, seq2: list) -> tuple:
     """
     vectors1 = [keypoints_to_vector(kp) for kp in seq1]
     vectors2 = [keypoints_to_vector(kp) for kp in seq2]
-
     distance, path = fastdtw(vectors1, vectors2, dist=cosine)
     return distance, path
 
@@ -91,20 +106,47 @@ def smooth_scores(scores: np.ndarray, window: int = 11) -> np.ndarray:
     return savgol_filter(scores, window_length=min(window, len(scores) - 1 if len(scores) % 2 == 0 else len(scores)), polyorder=2)
 
 
+def _compute_dtw_penalty(user_distance: float, baseline: float, path_len: int) -> float:
+    """
+    คำนวณ penalty จาก cosine distance ต่อ frame (absolute threshold)
+
+    cosine distance อยู่ระหว่าง 0-2 เสมอ:
+      per_frame < 0.08  → เต้นถูก ใกล้เคียงมาก   → penalty 1.0
+      per_frame 0.08-0.15 → เต้นได้ มีผิดบ้าง    → penalty 0.9-0.8
+      per_frame 0.15-0.25 → เต้นผิดบ้าง          → penalty 0.7-0.5
+      per_frame 0.25-0.40 → เต้นผิดเยอะ           → penalty 0.4-0.2
+      per_frame > 0.40    → น่าจะเพลงอื่นหรือผิดหมด → penalty < 0.2
+    """
+    if path_len <= 0:
+        return 1.0
+
+    per_frame = user_distance / path_len
+
+    if   per_frame < 0.08:  penalty = 1.00
+    elif per_frame < 0.12:  penalty = 0.90
+    elif per_frame < 0.18:  penalty = 0.75
+    elif per_frame < 0.25:  penalty = 0.55
+    elif per_frame < 0.35:  penalty = 0.35
+    elif per_frame < 0.50:  penalty = 0.20
+    else:                   penalty = 0.10
+
+    return float(penalty)
+
+
 def grade_score(score: float) -> tuple:
     """แปลง score เป็น grade และ feedback"""
     if score >= 0.90:
-        return "S", "🌟 ยอดเยี่ยมมาก! ท่าทางใกล้เคียงศิลปินมาก"
+        return "S", "🌟 Excellent! Very close to the reference!"
     elif score >= 0.80:
-        return "A", "🎉 เก่งมาก! ท่าทางส่วนใหญ่ถูกต้อง"
+        return "A", "🎉 Great job! Most moves are correct."
     elif score >= 0.70:
-        return "B", "👍 ดีครับ! มีบางท่าที่ต้องปรับปรุง"
+        return "B", "👍 Good! Some moves need improvement."
     elif score >= 0.60:
-        return "C", "💪 พอใช้ได้ ลองฝึกซ้ำอีกหน่อยนะครับ"
+        return "C", "💪 Fair. Keep practicing!"
     elif score >= 0.50:
-        return "D", "🔄 ยังต้องฝึกอีก โดยเฉพาะท่วงท่าหลัก"
+        return "D", "🔄 Needs more practice on key moves."
     else:
-        return "F", "📚 ยังต้องดูและฝึกท่าเต้นเพิ่มเติมครับ"
+        return "F", "📚 Please study and practice the choreography more."
 
 
 # ========== Main Comparison Function ==========
@@ -115,6 +157,9 @@ def compare_dance(
     output_dir: str = "results",
     sample_fps: float = 10.0,
     create_comparison_video: bool = True,
+    ref_start_offset: float = 0.0,
+    user_start_offset: float = 0.0,
+    pass_threshold: float = 0.5,
 ) -> dict:
     """
     เปรียบเทียบการเต้นของผู้ใช้กับ reference
@@ -125,6 +170,8 @@ def compare_dance(
         output_dir: โฟลเดอร์สำหรับบันทึกผลลัพธ์
         sample_fps: fps ที่ใช้ extract
         create_comparison_video: สร้างวิดีโอเปรียบเทียบหรือไม่
+        ref_start_offset: ข้าม X วินาทีแรกของ reference (user เริ่มเร็วกว่า)
+        user_start_offset: ข้าม X วินาทีแรกของ user video (user เริ่มช้ากว่า)
 
     Returns:
         dict ผลลัพธ์การเปรียบเทียบ
@@ -142,8 +189,28 @@ def compare_dance(
     if len(user_data["keypoints"]) < 5:
         raise ValueError("วิดีโอของคุณสั้นเกินไป หรือหา pose ไม่เจอ กรุณาตรวจสอบแสงและมุมกล้อง")
 
-    ref_kps = reference_data["keypoints"]
+    ref_kps  = reference_data["keypoints"]
     user_kps = user_data["keypoints"]
+
+    # ตัด ref keypoints ตาม offset (ถ้า user เร็วกว่า ref)
+    if ref_start_offset > 0:
+        skip_frames = int(ref_start_offset * sample_fps)
+        ref_kps = ref_kps[skip_frames:]
+        ref_raw = reference_data.get("raw_keypoints", [])
+        if ref_raw:
+            reference_data = dict(reference_data)
+            reference_data["raw_keypoints"] = ref_raw[skip_frames:]
+        print(f"  ⏩ Skip reference {ref_start_offset:.2f}s ({skip_frames} frames)")
+
+    # ตัด user keypoints ตาม offset (ถ้า user ช้ากว่า ref / เริ่มช้า)
+    if user_start_offset > 0:
+        skip_frames = int(user_start_offset * sample_fps)
+        user_kps = user_kps[skip_frames:]
+        user_raw = user_data.get("raw_keypoints", [])
+        if user_raw:
+            user_data = dict(user_data)
+            user_data["raw_keypoints"] = user_raw[skip_frames:]
+        print(f"  ⏩ Skip user video {user_start_offset:.2f}s ({skip_frames} frames)")
 
     # 2. DTW alignment
     print(f"\n[2/3] กำลังเปรียบเทียบท่าเต้น ({len(ref_kps)} vs {len(user_kps)} frames)...")
@@ -153,23 +220,53 @@ def compare_dance(
     raw_scores = compute_similarity_along_path(ref_kps, user_kps, dtw_path)
     smooth = smooth_scores(raw_scores)
 
-    overall_score = float(np.mean(raw_scores))
+    # ── DTW distance penalty ───────────────────────────────────────────
+    # per-frame cosine distance บอกว่าท่าต่างกันแค่ไหนโดยเฉลี่ย
+    # ถ้าสูง → ท่าต่างกันมาก (อาจเป็นคนละเพลง) → หักคะแนน
+    dtw_penalty    = _compute_dtw_penalty(dtw_distance, 0, len(dtw_path))
+    per_frame_dist = dtw_distance / max(len(dtw_path), 1)
+
+    raw_score_mean = float(np.mean(raw_scores))
+
+    # ── Pass/Fail classification ──────────────────────────────────────────
+    # ทำก่อน grade เพราะ binary classifier ส่งผลต่อ overall_score
+    pf_analysis = _analyze_pass_fail(user_kps, sample_fps, threshold=pass_threshold)
+
+    # ถ้ามี binary classifier (supervised) → ใช้ pass_rate ปรับคะแนน
+    # ถ้ามีแค่ anomaly detector → แสดงผลอย่างเดียว ไม่ปรับคะแนน
+    if pf_analysis.get('available') and pf_analysis.get('model_type') == 'supervised':
+        pass_rate = pf_analysis['pass_rate']
+        if   pass_rate >= 0.85: pass_weight = 1.00
+        elif pass_rate >= 0.65: pass_weight = 0.70
+        elif pass_rate >= 0.45: pass_weight = 0.40
+        else:                   pass_weight = 0.15
+        overall_score = float(raw_score_mean * dtw_penalty * pass_weight)
+        print(f"  Pass/Fail classifier: {pass_rate:.1%} PASS  →  weight {pass_weight:.2f}x")
+    else:
+        overall_score = float(raw_score_mean * dtw_penalty)
+
+    print(f"  DTW per-frame distance: {per_frame_dist:.3f}  →  penalty {dtw_penalty:.2f}x")
+    if dtw_penalty < 0.90:
+        print(f"  ⚠️  ท่าต่างจาก reference มาก")
+
     grade, feedback = grade_score(overall_score)
 
     print(f"\n[3/3] สร้าง visualization...")
 
-    # 3. สร้าง plot
-    plot_path = _create_score_plot(raw_scores, smooth, overall_score, grade, output_dir)
+    # 3. Body part analysis (ต้องทำก่อน plot)
+    body_analysis = _analyze_body_parts(ref_kps, user_kps, dtw_path)
 
-    # 4. สร้างวิดีโอเปรียบเทียบ (optional)
+    # 4. สร้าง plot
+    plot_path = _create_score_plot(raw_scores, smooth, overall_score, grade, output_dir, body_analysis)
+
+    # 5. สร้างวิดีโอเปรียบเทียบ (optional)
     video_path = None
     if create_comparison_video:
         video_path = _create_comparison_video(
-            reference_data, user_data, dtw_path, raw_scores, output_dir
+            reference_data, user_data, dtw_path, raw_scores, output_dir,
+            ref_start_offset=ref_start_offset,
+            user_start_offset=user_start_offset,
         )
-
-    # 5. Body part analysis
-    body_analysis = _analyze_body_parts(ref_kps, user_kps, dtw_path)
 
     results = {
         "overall_score": overall_score,
@@ -179,6 +276,8 @@ def compare_dance(
         "frame_scores": raw_scores.tolist(),
         "smooth_scores": smooth.tolist(),
         "body_analysis": body_analysis,
+        "pf_analysis":      pf_analysis,
+        "pass_threshold":   pass_threshold,
         "output_plot": plot_path,
         "output_video": video_path,
         "num_ref_frames": len(ref_kps),
@@ -239,12 +338,64 @@ def _analyze_body_parts(ref_kps: list, user_kps: list, dtw_path: list) -> dict:
     return analysis
 
 
+def _analyze_pass_fail(user_kps: list, sample_fps: float = 10.0, threshold: float = 0.5) -> dict:
+    """
+    ตรวจจับ PASS/FAIL ต่อ frame
+    ลำดับความสำคัญ:
+      1. BinaryClassifier (supervised — ต้องการ FAIL video)  → ปรับคะแนนหลัก
+      2. AnomalyDetector  (unsupervised — ไม่ต้องการ FAIL data) → แสดงผลอย่างเดียว
+    """
+    from pose_classifier import BinaryClassifier, AnomalyDetector
+
+    kps_arr = np.array(user_kps)
+
+    # ลอง binary classifier ก่อน
+    bc = BinaryClassifier(sample_fps=sample_fps)
+    if bc.is_loaded:
+        try:
+            frames     = bc.predict_frames(kps_arr, threshold=threshold)
+            pass_count = sum(1 for f in frames if f['is_pass'])
+            fail_count = len(frames) - pass_count
+            pass_rate  = pass_count / max(len(frames), 1)
+            return {
+                'available':   True,
+                'model_type':  'supervised',
+                'frames':      frames,
+                'pass_count':  pass_count,
+                'fail_count':  fail_count,
+                'pass_rate':   pass_rate,
+            }
+        except Exception as e:
+            print(f"  BinaryClassifier error: {e}")
+
+    # fallback → anomaly detector
+    ad = _get_pf_classifier(sample_fps)
+    if ad is None or not ad.is_loaded:
+        return {'available': False}
+    try:
+        frames     = ad.predict_frames(kps_arr, smooth_window=5, threshold=threshold)
+        pass_count = sum(1 for f in frames if f['is_pass'])
+        fail_count = len(frames) - pass_count
+        pass_rate  = pass_count / max(len(frames), 1)
+        return {
+            'available':   True,
+            'model_type':  'anomaly',
+            'frames':      frames,
+            'pass_count':  pass_count,
+            'fail_count':  fail_count,
+            'pass_rate':   pass_rate,
+        }
+    except Exception as e:
+        return {'available': False, 'error': str(e)}
+
+
 def _create_score_plot(
     raw_scores: np.ndarray,
     smooth_scores: np.ndarray,
     overall_score: float,
     grade: str,
     output_dir: str,
+    body_analysis: dict = None,
 ) -> str:
     """สร้างกราฟแสดงผล similarity score"""
 
@@ -264,7 +415,7 @@ def _create_score_plot(
     ax1.axhline(y=overall_score, color='#ffd700', linewidth=1.5, linestyle='--',
                 label=f'Average: {overall_score:.1%}')
 
-    ax1.set_title('Similarity Score ตลอดการเต้น', color='white', fontsize=13, pad=10)
+    ax1.set_title('Similarity Score Over Time', color='white', fontsize=13, pad=10)
     ax1.set_xlabel('Frame', color='#aaaaaa')
     ax1.set_ylabel('Similarity', color='#aaaaaa')
     ax1.set_ylim(0, 1.05)
@@ -310,16 +461,31 @@ def _create_score_plot(
     ax2.axis('off')
     ax2.set_title('Overall Score', color='white', fontsize=12, pad=8)
 
-    # ---- Plot 3: Body Part Analysis ----
-    ax3 = fig.add_subplot(gs[1, 1])
+    # ---- Plot 3: Body Part Analysis (radar chart) ----
+    ax3 = fig.add_subplot(gs[1, 1], polar=True)
     ax3.set_facecolor('#16213e')
 
-    # Placeholder - will be filled after body analysis
-    ax3.text(0.5, 0.5, 'Body Part\nAnalysis\n(ดูใน results dict)',
-             ha='center', va='center', color='#aaaaaa', fontsize=10,
-             transform=ax3.transAxes)
-    ax3.set_title('Body Part Scores', color='white', fontsize=12, pad=8)
-    ax3.axis('off')
+    if body_analysis:
+        parts = list(body_analysis.keys())
+        scores = [body_analysis[p]["score"] for p in parts]
+        N = len(parts)
+        angles = [n / float(N) * 2 * np.pi for n in range(N)]
+        angles += angles[:1]
+        scores_plot = scores + scores[:1]
+
+        ax3.set_theta_offset(np.pi / 2)
+        ax3.set_theta_direction(-1)
+        ax3.plot(angles, scores_plot, 'o-', linewidth=2, color='#00d4ff')
+        ax3.fill(angles, scores_plot, alpha=0.25, color='#00d4ff')
+        ax3.set_xticks(angles[:-1])
+        ax3.set_xticklabels(parts, color='white', fontsize=9)
+        ax3.set_ylim(0, 1)
+        ax3.set_yticks([0.25, 0.5, 0.75, 1.0])
+        ax3.set_yticklabels(['25%','50%','75%','100%'], color='#888888', fontsize=7)
+        ax3.grid(color='#444444', alpha=0.5)
+        ax3.spines['polar'].set_color('#444444')
+
+    ax3.set_title('Body Part Scores', color='white', fontsize=12, pad=15)
 
     plt.suptitle('🎵 K-Pop Dance Analysis Report', color='white', fontsize=15,
                  fontweight='bold', y=0.98)
@@ -331,108 +497,269 @@ def _create_score_plot(
     return plot_path
 
 
+
+def _extract_audio(video_path: str, out_wav: str) -> bool:
+    """Extract audio จากวิดีโอเป็น WAV ด้วย ffmpeg"""
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn", "-acodec", "pcm_s16le",
+            "-ar", "22050", "-ac", "1", out_wav
+        ], capture_output=True, check=True)
+        return os.path.exists(out_wav)
+    except Exception:
+        return False
+
+
+def compute_beat_sync_map(ref_video: str, user_video: str, verbose: bool = True) -> np.ndarray:
+    """
+    คำนวณ beat-based time mapping จาก user → reference
+
+    Returns:
+        beat_map: array ขนาด (N,) โดย beat_map[i] = เวลาใน user video
+                  ที่ตรงกับวินาทีที่ i ของ reference video
+                  ถ้าคำนวณไม่ได้ returns None
+    """
+    try:
+        import librosa
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ref_wav  = os.path.join(tmpdir, "ref.wav")
+            user_wav = os.path.join(tmpdir, "user.wav")
+
+            if verbose:
+                print("  🎵 Extracting audio...")
+
+            ok_r = _extract_audio(ref_video, ref_wav)
+            ok_u = _extract_audio(user_video, user_wav)
+
+            if not ok_r or not ok_u:
+                print("  ⚠️ ไม่สามารถ extract audio ได้ ใช้ linear sync แทน")
+                return None
+
+            if verbose:
+                print("  🥁 Detecting beats...")
+
+            y_ref,  sr = librosa.load(ref_wav,  sr=22050)
+            y_user, _  = librosa.load(user_wav, sr=22050)
+
+            # beat tracking
+            tempo_r, beats_r = librosa.beat.beat_track(y=y_ref,  sr=sr, units='time')
+            tempo_u, beats_u = librosa.beat.beat_track(y=y_user, sr=sr, units='time')
+
+            if len(beats_r) < 4 or len(beats_u) < 4:
+                print("  ⚠️ หา beat ได้น้อยเกินไป ใช้ linear sync แทน")
+                return None
+
+            if verbose:
+                print(f"  Reference: {len(beats_r)} beats @ {float(tempo_r):.1f} BPM")
+                print(f"  User     : {len(beats_u)} beats @ {float(tempo_u):.1f} BPM")
+
+            # สร้าง time map: สำหรับแต่ละวินาทีใน ref → วินาทีที่ตรงใน user
+            ref_duration  = len(y_ref)  / sr
+            user_duration = len(y_user) / sr
+
+            # ใช้ DTW บน beat timestamps เพื่อ align
+            from fastdtw import fastdtw as _dtw
+            beats_r2 = beats_r.reshape(-1, 1)
+            beats_u2 = beats_u.reshape(-1, 1)
+            _, beat_path = _dtw(beats_r2, beats_u2, dist=lambda a, b: abs(a[0] - b[0]))
+
+            # สร้าง lookup: ref_beat_time → user_beat_time
+            ref_beat_times  = [beats_r[ri] for ri, ui in beat_path]
+            user_beat_times = [beats_u[ui] for ri, ui in beat_path]
+
+            # interpolate เป็น per-second map
+            n_seconds = int(ref_duration) + 1
+            beat_map  = np.interp(
+                np.arange(n_seconds, dtype=float),
+                ref_beat_times,
+                user_beat_times,
+                left=0.0,
+                right=user_duration,
+            )
+
+            if verbose:
+                print(f"  ✅ Beat sync map สร้างสำเร็จ ({n_seconds}s)")
+
+            return beat_map
+
+    except ImportError:
+        print("  ⚠️ ไม่พบ librosa ใช้ linear sync แทน")
+        return None
+    except Exception as e:
+        print(f"  ⚠️ Beat sync error: {e} — ใช้ linear sync แทน")
+        return None
+
 def _create_comparison_video(
     reference_data: dict,
     user_data: dict,
     dtw_path: list,
     frame_scores: np.ndarray,
     output_dir: str,
-    max_frames: int = 300,
+    max_frames: int = 99999,
+    ref_start_offset: float = 0.0,
+    user_start_offset: float = 0.0,
 ) -> Optional[str]:
-    """สร้างวิดีโอเปรียบเทียบ side-by-side"""
-
+    """
+    สร้างวิดีโอเปรียบเทียบ side-by-side
+    - sync วิดีโอตาม offset ที่ตั้งไว้
+    - skeleton ใช้ DTW path จริง (ไม่ใช่ linear ratio)
+    """
     try:
-        ref_video_path = reference_data.get("video_info", {}).get("path")
+        ref_video_path  = reference_data.get("video_info", {}).get("path")
         user_video_path = user_data.get("video_info", {}).get("path")
 
         if not ref_video_path or not os.path.exists(ref_video_path):
             print("  ⚠️ ไม่พบ reference video สำหรับสร้าง comparison video")
             return None
 
-        ref_kps = reference_data["keypoints"]
+        ref_kps  = reference_data["keypoints"]
         user_kps = user_data["keypoints"]
+        ref_raw  = reference_data.get("raw_keypoints", [])
+        user_raw = user_data.get("raw_keypoints", [])
 
-        cap_ref = cv2.VideoCapture(ref_video_path)
+        # ── DTW lookup: ref sample index → user sample index ──────────
+        # dtw_path เป็น [(ri, ui), ...] หลังตัด offset แล้ว
+        ref_to_user_si: dict[int, int] = {}
+        for ri, ui in dtw_path:
+            if ri not in ref_to_user_si:
+                ref_to_user_si[ri] = ui
+
+        # score ต่อ ref sample index
+        score_map: dict[int, float] = {}
+        for path_idx, (ri, ui) in enumerate(dtw_path):
+            if ri not in score_map:
+                score_map[ri] = frame_scores[path_idx] if path_idx < len(frame_scores) else 0.5
+
+        cap_ref  = cv2.VideoCapture(ref_video_path)
         cap_user = cv2.VideoCapture(user_video_path)
 
-        ref_fps = cap_ref.get(cv2.CAP_PROP_FPS)
-        frame_w = int(cap_ref.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_h = int(cap_ref.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        user_w = int(cap_user.get(cv2.CAP_PROP_FRAME_WIDTH))
-        user_h = int(cap_user.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        ref_fps   = cap_ref.get(cv2.CAP_PROP_FPS)  or 30.0
+        user_fps  = cap_user.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_w   = int(cap_ref.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h   = int(cap_ref.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Resize user video ให้ตรงกับ reference
-        out_w = frame_w * 2 + 10  # side by side
+        ref_sample_fps  = reference_data.get("sample_fps", 10.0)
+        user_sample_fps = user_data.get("sample_fps", 10.0)
+        sample_interval = max(1, int(ref_fps / ref_sample_fps))   # กี่ video-frame ต่อ 1 sample
+
+        # ── Skip ตาม offset ───────────────────────────────────────────
+        if ref_start_offset > 0:
+            skip_r = int(ref_start_offset * ref_fps)
+            cap_ref.set(cv2.CAP_PROP_POS_FRAMES, skip_r)
+            print(f"  ⏩ Skip reference {ref_start_offset:.2f}s ({skip_r} frames)")
+
+        if user_start_offset > 0:
+            skip_u = int(user_start_offset * user_fps)
+            cap_user.set(cv2.CAP_PROP_POS_FRAMES, skip_u)
+            print(f"  ⏩ Skip user video {user_start_offset:.2f}s ({skip_u} frames)")
+
+        out_w = frame_w * 2 + 6
         out_h = frame_h
-
         output_path = os.path.join(output_dir, "comparison.mp4")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, ref_fps, (out_w, out_h))
+        out    = cv2.VideoWriter(output_path, fourcc, ref_fps, (out_w, out_h))
 
-        # Map DTW path: ref_frame_idx → (score, user_frame_idx)
-        path_dict = {}
-        for path_idx, (ri, ui) in enumerate(dtw_path):
-            if ri not in path_dict:
-                path_dict[ri] = (frame_scores[path_idx] if path_idx < len(frame_scores) else 0.5, ui)
+        # Beat sync map (optional)
+        beat_map      = compute_beat_sync_map(ref_video_path, user_video_path)
+        use_beat_sync = beat_map is not None
+        sync_mode     = "beat sync 🥁" if use_beat_sync else "linear sync"
+        print(f"  กำลังสร้าง comparison video ({sync_mode})...")
 
-        ref_sample_fps = reference_data.get("sample_fps", 10.0)
-        frame_interval = max(1, int(ref_fps / ref_sample_fps))
+        ref_frame_idx  = int(ref_start_offset * ref_fps)   # video frame index (ใน file)
+        user_frame_idx = int(user_start_offset * user_fps)  # video frame index (ใน file)
+        sample_count   = 0    # ref sample index (หลัง offset)
+        written        = 0
+        current_score  = 0.5
+        last_frame_u   = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+        # skeleton ที่วาดล่าสุด (persist ข้ามเฟรมวิดีโอที่ไม่ใช่ sample point)
+        last_frame_r_sk = None
+        last_frame_u_sk = None
 
-        ref_frame_count = 0
-        sample_count = 0
-
-        print(f"  กำลังสร้าง comparison video...")
-        written_frames = 0
-
-        while cap_ref.isOpened() and written_frames < max_frames * frame_interval:
+        while cap_ref.isOpened() and written < max_frames:
             ret_r, frame_r = cap_ref.read()
             if not ret_r:
                 break
 
-            if ref_frame_count % frame_interval == 0 and sample_count in path_dict:
-                score, user_sample_idx = path_dict[sample_count]
+            # ── sync user video frame ตาม WALL CLOCK (linear) ──────────
+            # video เล่นตามเวลาจริง → user ไม่ถูกเร่ง/ช้า
+            # ถ้า timing ไม่ตรง ให้ปรับ USER_START_OFFSET ใน Cell 3
+            elapsed_frames = ref_frame_idx - int(ref_start_offset * ref_fps)
+            elapsed_sec    = elapsed_frames / ref_fps
+            user_target_frame = int(user_start_offset * user_fps) + int(elapsed_sec * user_fps)
 
-                # ดึง frame จาก user video
-                user_frame_pos = int(user_sample_idx * frame_interval)
-                cap_user.set(cv2.CAP_PROP_POS_FRAMES, user_frame_pos)
-                ret_u, frame_u = cap_user.read()
-
+            while user_frame_idx <= user_target_frame:
+                ret_u, frame_u_read = cap_user.read()
                 if not ret_u:
-                    frame_u = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+                    break
+                last_frame_u = frame_u_read
+                user_frame_idx += 1
 
-                # Resize user frame
-                frame_u_resized = cv2.resize(frame_u, (frame_w, frame_h))
+            frame_u = cv2.resize(last_frame_u, (frame_w, frame_h))
 
-                # วาด skeleton บน frames
+            # ── วาด skeleton เมื่อถึง sample point ────────────────────
+            if elapsed_frames % sample_interval == 0:
+                if sample_count in score_map:
+                    current_score = score_map[sample_count]
+
+                # ref skeleton
                 if sample_count < len(ref_kps):
-                    frame_r = visualize_pose_on_frame(frame_r, ref_kps[sample_count], color=(0, 255, 100))
-                if user_sample_idx < len(user_kps):
-                    frame_u_resized = visualize_pose_on_frame(frame_u_resized, user_kps[user_sample_idx], color=(255, 100, 0))
+                    r_raw = ref_raw[sample_count] if sample_count < len(ref_raw) else None
+                    frame_r = visualize_pose_on_frame(
+                        frame_r, ref_kps[sample_count],
+                        color=(0, 255, 100), raw_keypoints=r_raw)
+                    last_frame_r_sk = (ref_kps[sample_count], r_raw)
 
-                # สร้าง score bar
-                score_color = _score_to_color(score)
-                _draw_score_bar(frame_r, score, score_color, label="ศิลปิน")
-                _draw_score_bar(frame_u_resized, score, score_color, label="คุณ")
-
-                # รวม side-by-side
-                divider = np.zeros((frame_h, 10, 3), dtype=np.uint8)
-                combined = np.hstack([frame_r, divider, frame_u_resized])
-                out.write(combined)
-                written_frames += 1
+                # user skeleton — linear time (ตรงกับ video ที่เห็น)
+                # ดู ref sample ไหน → ดู user sample เดียวกัน
+                # เห็นตรงๆ ว่าช้า/เร็ว/ผิดต่างกันยังไง
+                user_si = min(sample_count, len(user_kps) - 1)
+                u_raw = user_raw[user_si] if user_si < len(user_raw) else None
+                frame_u = visualize_pose_on_frame(
+                    frame_u, user_kps[user_si],
+                    color=(255, 100, 0), raw_keypoints=u_raw)
+                last_frame_u_sk = (user_kps[user_si], u_raw)
 
                 sample_count += 1
+            else:
+                # ระหว่าง sample points → วาด skeleton เดิมซ้ำ ให้ smooth
+                if last_frame_r_sk is not None:
+                    frame_r = visualize_pose_on_frame(
+                        frame_r, last_frame_r_sk[0],
+                        color=(0, 255, 100), raw_keypoints=last_frame_r_sk[1])
+                if last_frame_u_sk is not None:
+                    frame_u = visualize_pose_on_frame(
+                        frame_u, last_frame_u_sk[0],
+                        color=(255, 100, 0), raw_keypoints=last_frame_u_sk[1])
 
-            ref_frame_count += 1
+            # ── overlay ────────────────────────────────────────────────
+            score_color = _score_to_color(current_score)
+            _draw_score_bar(frame_r, current_score, score_color, label="Artist")
+            _draw_score_bar(frame_u, current_score, score_color, label="You")
+
+            cv2.putText(frame_r, "REFERENCE", (10, frame_h - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 100), 2, cv2.LINE_AA)
+            cv2.putText(frame_u, "YOU", (10, frame_h - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 100, 0), 2, cv2.LINE_AA)
+
+            divider  = np.full((frame_h, 6, 3), 40, dtype=np.uint8)
+            combined = np.hstack([frame_r, divider, frame_u])
+            out.write(combined)
+            written       += 1
+            ref_frame_idx += 1
 
         cap_ref.release()
         cap_user.release()
         out.release()
 
-        print(f"  ✓ บันทึก comparison video: {output_path}")
+        print(f"  ✓ บันทึก comparison video: {output_path} ({written} frames)")
         return output_path
 
     except Exception as e:
+        import traceback
         print(f"  ⚠️ ไม่สามารถสร้าง comparison video: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -487,11 +814,39 @@ def _print_results(results: dict) -> None:
     for part, data in results["body_analysis"].items():
         bar = "█" * int(data["score"] * 20) + "░" * (20 - int(data["score"] * 20))
         print(f"    {part:8s}  [{bar}]  {data['score']:.0%}  ({data['grade']})")
+    # Anomaly Detection analysis
+    pf = results.get("pf_analysis", {})
+    if pf.get("available"):
+        GREEN = '\033[92m'; RED = '\033[91m'
+        thresh = results.get('pass_threshold', 0.5)
+        print(f"\n  Anomaly Detection (Isolation Forest):")
+        print(f"    PASS rate  : {pf['pass_rate']:.1%}  "
+              f"({pf['pass_count']} frames PASS / {pf['fail_count']} frames FAIL)")
+        print(f"    Threshold  : {thresh}")
+        # แสดง FAIL runs ที่ยาวกว่า 2 วินาที
+        frames = pf.get('frames', [])
+        fail_runs = []
+        in_fail = False
+        for f in frames:
+            if not f['is_pass'] and not in_fail:
+                run_start = f['time']; in_fail = True
+            elif f['is_pass'] and in_fail:
+                fail_runs.append((run_start, f['time'])); in_fail = False
+        if in_fail and frames:
+            fail_runs.append((run_start, frames[-1]['time']))
+        fail_runs = [(s, e) for s, e in fail_runs if e - s >= 2.0]
+        if fail_runs:
+            print(f"\n    ช่วงที่ต้องฝึกเพิ่ม:")
+            for s, e in fail_runs[:8]:
+                ms, ss = divmod(int(s), 60)
+                me, se = divmod(int(e), 60)
+                print(f"      {ms:02d}:{ss:02d} – {me:02d}:{se:02d}  ({e-s:.1f}s)")
+
     print()
     if results.get("output_plot"):
-        print(f"  📈 Plot: {results['output_plot']}")
+        print(f"  Plot : {results['output_plot']}")
     if results.get("output_video"):
-        print(f"  🎬 Video: {results['output_video']}")
+        print(f"  Video: {results['output_video']}")
     print("="*50)
 
 

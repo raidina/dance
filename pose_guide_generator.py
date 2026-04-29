@@ -586,8 +586,9 @@ def create_dance_guide_pdf(
             mins = int(ts // 60)
             secs = ts % 60
             time_str = f"{mins}:{secs:05.2f}"
+            grade_emoji = "🟢" if pose.get("movement", 0) > 0.05 else "🔵"
             label_row.append(
-                Paragraph(f"<b>ท่าที่ {pose_num}</b><br/>⏱ {time_str}", pose_label_style)
+                Paragraph(f"<b>#{pose_num}</b>  {grade_emoji}  <font color='#888888'>{time_str}</font>", pose_label_style)
             )
 
         while len(label_row) < poses_per_row:
@@ -618,6 +619,123 @@ def create_dance_guide_pdf(
     return output_path
 
 
+
+# ---------------------------------------------------------------------------
+# Skeleton Video
+# ---------------------------------------------------------------------------
+
+def create_skeleton_video(
+    video_path: str,
+    output_path: str = "results/skeleton_video.mp4",
+    person_index: int = None,
+    verbose: bool = True,
+) -> str:
+    """
+    สร้างวิดีโอที่มี skeleton วาดทับทุกเฟรม
+
+    Args:
+        video_path: path วิดีโอต้นฉบับ
+        output_path: path output MP4
+        person_index: ลำดับคนที่ต้องการ (None = คนเดียว)
+        verbose: แสดง progress
+
+    Returns:
+        path ของวิดีโอที่สร้าง
+    """
+    from reference_processor import PersonTracker
+
+    # โหลด pose model
+    model_path = _get_pose_model(os.path.dirname(os.path.abspath(__file__)))
+    base_opts = _mp_python.BaseOptions(model_asset_path=model_path)
+    pose_opts = _mp_vision.PoseLandmarkerOptions(
+        base_options=base_opts,
+        running_mode=_mp_vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    landmarker = _mp_vision.PoseLandmarker.create_from_options(pose_opts)
+
+    tracker = PersonTracker(target_person_index=person_index) if person_index is not None else None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"ไม่สามารถเปิดวิดีโอ: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    if verbose:
+        print(f"\n[Skeleton Video] {os.path.basename(video_path)}")
+        print(f"  {w}x{h} @ {fps:.1f}fps | {total} frames")
+
+    pbar = tqdm(total=total, desc="Writing skeleton video") if verbose else None
+    frame_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # detect pose
+        if tracker:
+            bbox = tracker.get_target_bbox(frame)
+            if bbox:
+                x, y, fw2, fh2 = bbox
+                pad = int(max(fw2, fh2) * 0.15)
+                x1, y1 = max(0, x - pad), max(0, y - pad)
+                x2, y2 = min(w, x + fw2 + pad), min(h, y + fh2 + pad)
+                crop = frame[y1:y2, x1:x2]
+                frame_rgb = cv2.cvtColor(crop if crop.size > 0 else frame, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        result = landmarker.detect(mp_img)
+
+        output_frame = frame.copy()
+        if result.pose_landmarks:
+            lm = result.pose_landmarks[0]
+            raw_kps = np.array([[lm[i].x, lm[i].y] for i in DANCE_KEYPOINTS], dtype=np.float32)
+            kps_norm = normalize_keypoints(raw_kps)
+            output_frame = draw_skeleton_on_frame(
+                output_frame, kps_norm,
+                raw_keypoints=raw_kps,
+                line_thickness=4,
+                circle_radius=7,
+            )
+
+        # timestamp overlay
+        ts = frame_count / fps
+        mins, secs = int(ts // 60), ts % 60
+        cv2.putText(output_frame, f"{mins}:{secs:05.2f}", (12, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(output_frame, f"{mins}:{secs:05.2f}", (12, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+        writer.write(output_frame)
+        if pbar:
+            pbar.update(1)
+        frame_count += 1
+
+    cap.release()
+    writer.release()
+    landmarker.close()
+    if pbar:
+        pbar.close()
+
+    print(f"\n✅ Skeleton video สำเร็จ: {output_path}")
+    return output_path
+
 # ---------------------------------------------------------------------------
 # All-in-one function
 # ---------------------------------------------------------------------------
@@ -631,6 +749,7 @@ def generate_dance_guide(
     song_name: str = "",
     motion_threshold: float = 0.03,
     mode: str = "hold",
+    create_video: bool = True,
 ) -> str:
     """
     ฟังก์ชันหลัก — รันทุกอย่างในครั้งเดียว
@@ -671,7 +790,7 @@ def generate_dance_guide(
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     title = song_name if song_name else f"Dance Guide: {video_name[:40]}"
 
-    return create_dance_guide_pdf(
+    pdf_path = create_dance_guide_pdf(
         video_path=video_path,
         key_poses=key_poses,
         pose_images=pose_images,
@@ -680,6 +799,17 @@ def generate_dance_guide(
         poses_per_row=poses_per_row,
         song_name=song_name,
     )
+
+    # สร้าง skeleton video
+    if create_video:
+        video_out = output_path.replace(".pdf", "_skeleton.mp4")
+        create_skeleton_video(
+            video_path=video_path,
+            output_path=video_out,
+            person_index=person_index,
+        )
+
+    return pdf_path
 
 
 if __name__ == "__main__":

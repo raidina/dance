@@ -255,19 +255,24 @@ class PersonTracker:
     5. smooth bbox ด้วย EMA ให้ภาพนิ่งขึ้น
     """
 
-    def __init__(self, target_person_index: int = 0):
+    def __init__(self, target_person_index: int = 0, target_cx: Optional[float] = None):
         """
         Args:
-            target_person_index: ลำดับของคนที่ต้องการ track
+            target_person_index: ลำดับของคนที่ต้องการ track (fallback ถ้าไม่มี target_cx)
                 0 = ซ้ายสุด, 1 = คนถัดไป, ... หรือ -1 = ขวาสุด
+            target_cx: x กลางของคนที่ต้องการ (จาก preview) — ถ้ามีจะ lock คนที่ใกล้สุด
         """
         self.target_index = target_person_index
+        self._target_cx   = target_cx      # cx จาก preview → ใช้ lock ใน frame แรก
         self._last_bbox: Optional[Tuple[int, int, int, int]] = None
         self._smooth_bbox: Optional[np.ndarray] = None   # EMA smoothed bbox
         self._velocity: np.ndarray = np.zeros(4)          # dx, dy, dw, dh per frame
         self._lost_frames = 0
-        self._max_lost = 15
-        self._ema_alpha = 0.6   # weight ของเฟรมใหม่ใน EMA (0=นิ่งมาก, 1=ตาม raw)
+        self._max_lost = 20
+        self._ema_alpha = 0.5   # weight ของเฟรมใหม่ใน EMA
+        self._position_history: list = []  # เก็บ 10 ตำแหน่งล่าสุด
+        self._history_max = 10
+        self._switch_threshold = 0.25  # ต้อง score สูงกว่านี้ถึงจะ switch target
 
         # โหลด YOLOv8 nano (โมเดลเล็ก ~6MB ดาวน์โหลดอัตโนมัติครั้งแรก)
         try:
@@ -366,48 +371,70 @@ class PersonTracker:
         self._lost_frames = 0
 
         if self._last_bbox is None:
-            # เฟรมแรก — เลือกตาม index
-            idx = max(0, min(self.target_index, len(detections) - 1))
-            if self.target_index == -1:
-                idx = len(detections) - 1
+            # เฟรมแรก — เลือกตาม cx จาก preview (ถ้ามี) ไม่งั้นใช้ index
+            if self._target_cx is not None and len(detections) > 0:
+                # lock คนที่ cx ใกล้ preview มากสุด
+                idx = min(range(len(detections)),
+                          key=lambda i: abs(detections[i][0] + detections[i][2] / 2 - self._target_cx))
+            else:
+                idx = max(0, min(self.target_index, len(detections) - 1))
+                if self.target_index == -1:
+                    idx = len(detections) - 1
             self._last_bbox = detections[idx]
             self._smooth_bbox = np.array(self._last_bbox, dtype=float)
             self._velocity = np.zeros(4)
+            self._position_history = [list(self._smooth_bbox)]
             return self._last_bbox
 
-        # ----- matching ด้วย combined score: IoU + centroid distance -----
+        # ----- matching ด้วย combined score: IoU + centroid + size -----
         predicted = self._predicted_bbox()
         pred_arr = np.array(predicted, dtype=float)
         pred_cx = pred_arr[0] + pred_arr[2] / 2
         pred_cy = pred_arr[1] + pred_arr[3] / 2
-        ref_size = max(pred_arr[2], pred_arr[3])  # ขนาดอ้างอิง
+        ref_size = max(pred_arr[2], pred_arr[3])
+
+        # ใช้ average velocity จาก history เพื่อ predict ตำแหน่งที่ควรจะเป็น
+        if len(self._position_history) >= 3:
+            recent = np.array(self._position_history[-3:], dtype=float)
+            avg_vel = np.mean(np.diff(recent, axis=0), axis=0)
+            extrapolated = np.array(pred_arr) + avg_vel
+            ext_cx = extrapolated[0] + extrapolated[2] / 2
+            ext_cy = extrapolated[1] + extrapolated[3] / 2
+        else:
+            ext_cx, ext_cy = pred_cx, pred_cy
 
         best_score = -float('inf')
         best_bbox  = None
 
         for bbox in detections:
-            # IoU กับ predicted position
             iou = self._iou(predicted, bbox)
 
-            # centroid distance (normalize ด้วยขนาด bbox)
             cx = bbox[0] + bbox[2] / 2
             cy = bbox[1] + bbox[3] / 2
+
+            # distance จาก predicted
             dist = ((cx - pred_cx)**2 + (cy - pred_cy)**2)**0.5
             norm_dist = dist / (ref_size + 1e-6)
 
-            # size similarity (กันกระโดดไปคนขนาดต่างกันมาก)
+            # distance จาก extrapolated (velocity-based)
+            ext_dist = ((cx - ext_cx)**2 + (cy - ext_cy)**2)**0.5
+            norm_ext_dist = ext_dist / (ref_size + 1e-6)
+
+            # size similarity
             size_ratio = min(bbox[2], pred_arr[2]) / (max(bbox[2], pred_arr[2]) + 1e-6)
             size_ratio *= min(bbox[3], pred_arr[3]) / (max(bbox[3], pred_arr[3]) + 1e-6)
 
-            # combined score: สูง = match ดี
-            score = (iou * 0.5) + (1.0 / (1.0 + norm_dist * 2)) * 0.3 + size_ratio * 0.2
+            # combined score
+            score = (iou * 0.4)                   + (1.0 / (1.0 + norm_dist * 2)) * 0.3                   + (1.0 / (1.0 + norm_ext_dist * 2)) * 0.2                   + size_ratio * 0.1
+
             if score > best_score:
                 best_score = score
                 best_bbox  = bbox
 
-        # ถ้า score ต่ำมาก (คนเดิมน่าจะหายไปชั่วคราว) ให้ใช้ค่าเดิม
-        if best_score < 0.15:
+        # ถ้า score ต่ำกว่า threshold → อย่า switch, ใช้ค่าเดิม
+        if best_score < self._switch_threshold:
             if self._smooth_bbox is not None:
+                self._smooth_bbox = self._smooth_bbox + self._velocity * 0.3
                 return tuple(self._smooth_bbox.astype(int))
             return self._last_bbox
 
@@ -423,6 +450,12 @@ class PersonTracker:
             self._smooth_bbox = self._ema_alpha * new_arr + (1 - self._ema_alpha) * self._smooth_bbox
 
         self._last_bbox = best_bbox
+
+        # เก็บ position history
+        self._position_history.append(list(new_arr))
+        if len(self._position_history) > self._history_max:
+            self._position_history.pop(0)
+
         return tuple(self._smooth_bbox.astype(int))
 
     @staticmethod
@@ -470,10 +503,11 @@ def preview_person_selection(
     save_path: str = "person_preview.png",
 ) -> int:
     """
-    Scan หลายเฟรม เลือกเฟรมที่เห็นคนมากที่สุด แล้วให้คลิกเลือกได้เลย
+    แสดงเฟรมแรกสุดที่เจอคนครบ พร้อมหมายเลขกำกับ
+    → preview ตรงกับเฟรมที่ tracker จะเริ่ม lock-on จริงๆ
 
     Returns:
-        person_index ที่เลือก
+        person_index ที่เลือก (0 เสมอ — user ต้องเลือกเอง)
     """
     tracker = PersonTracker(target_person_index=0)
     cap = cv2.VideoCapture(video_path)
@@ -481,106 +515,97 @@ def preview_person_selection(
         raise FileNotFoundError(f"ไม่สามารถเปิดวิดีโอ: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-
+    video_fps    = cap.get(cv2.CAP_PROP_FPS)
     raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"  ขนาดวิดีโอ: {raw_w}x{raw_h} ({'landscape' if raw_w > raw_h else 'portrait'})")
+    print(f"  ขนาดวิดีโอ: {raw_w}x{raw_h} | {video_fps:.0f} FPS")
 
-    # Scan 100 เฟรมกระจายทั่ววิดีโอ เลือกเฟรมที่คนครบและกระจายกว้างที่สุด
-    print("กำลังหาเฟรมที่เห็นครบทุกคน...")
-    scan_positions = np.linspace(0.03, 0.97, 100)
-
-    # เก็บทุกเฟรมที่ scan
-    all_candidates = []   # (frame, detections, frame_pos)
-
-    for pos in scan_positions:
-        frame_pos = int(total_frames * pos)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+    # ── ขั้น 1: หาจำนวนคนสูงสุดโดย scan 30 เฟรมแรก ───────────────
+    print("กำลังนับจำนวนคนในเฟรมแรกๆ...")
+    max_people = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for _ in range(min(60, total_frames)):
         ret, frame = cap.read()
         if not ret:
-            continue
+            break
         dets = tracker.detect_people(frame)
-        all_candidates.append((frame.copy(), dets, frame_pos))
+        max_people = max(max_people, len(dets))
+
+    print(f"  จำนวนคนสูงสุดที่เจอ: {max_people} คน")
+
+    # ── ขั้น 2: หาเฟรมแรกสุดที่เจอคนครบ (≥ max_people) ────────────
+    print("กำลังหาเฟรมแรกที่เห็นทุกคนพร้อมกัน...")
+    best_frame      = None
+    best_detections = []
+    best_frame_pos  = 0
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for frame_num in range(min(300, total_frames)):   # สูงสุด 10 วิ (ที่ 30fps)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        dets = tracker.detect_people(frame)
+        # เลือกเฟรมแรกที่เจอคนครบหรือขาดแค่ 1
+        if len(dets) >= max(max_people - 1, 1):
+            if best_frame is None or len(dets) > len(best_detections):
+                best_frame      = frame.copy()
+                best_detections = dets
+                best_frame_pos  = frame_num
+            # ได้คนครบแล้ว → หยุดทันที ไม่ต้องหาต่อ
+            if len(dets) >= max_people:
+                break
 
     cap.release()
 
-    if not all_candidates:
-        raise ValueError("ไม่สามารถอ่านเฟรมจากวิดีโอ")
-
-    # หาจำนวนคนสูงสุดที่เจอ
-    max_count = max(len(c[1]) for c in all_candidates)
-    print(f"  จำนวนคนสูงสุดที่เจอ: {max_count} คน")
-
-    # กรองเฉพาะเฟรมที่เจอคนมากที่สุด (หรือขาดแค่ 1)
-    top_candidates = [c for c in all_candidates if len(c[1]) >= max(max_count - 1, 1)]
-
-    # score = จำนวนคน (หลัก) + span กว้าง (รอง) + โบนัสถ้ามีคนอยู่ขอบซ้าย/ขวา
-    frame_w_global = all_candidates[0][0].shape[1]
-
-    def frame_score(candidate):
-        _, dets, _ = candidate
-        if not dets:
-            return (0, 0, 0)
-        centers_x = [x + w / 2 for (x, y, w, h) in dets]
-        span = max(centers_x) - min(centers_x)
-        # โบนัส: มีคนอยู่ในโซนขอบซ้าย (<20%) และขอบขวา (>80%)
-        has_left  = any(cx < frame_w_global * 0.20 for cx in centers_x)
-        has_right = any(cx > frame_w_global * 0.80 for cx in centers_x)
-        edge_bonus = (1 if has_left else 0) + (1 if has_right else 0)
-        return (len(dets), edge_bonus, span)
-
-    best_frame, best_detections, best_frame_pos = max(top_candidates, key=frame_score)
-    score = frame_score((best_frame, best_detections, best_frame_pos))
-    print(f"  เลือกเฟรม t={best_frame_pos/video_fps:.1f}s → พบ {len(best_detections)} คน | edge={score[1]} | span={score[2]:.0f}px")
-
     if best_frame is None:
-        raise ValueError("ไม่สามารถอ่านเฟรมจากวิดีโอ")
+        raise ValueError("ไม่พบคนในวิดีโอ — ตรวจสอบว่าวิดีโอเห็นคนชัดเจน")
 
-    # วาดกรอบ + หมายเลขบนเฟรมที่ดีที่สุด
+    print(f"  ✓ ใช้เฟรม #{best_frame_pos} (t={best_frame_pos/video_fps:.2f}s) — พบ {len(best_detections)} คน")
+    print(f"  ⚠️  นี่คือเฟรมเดียวกับที่ tracker จะเริ่ม tracking จริง")
+
+    # ── วาดกรอบ + หมายเลข ──────────────────────────────────────────
     frame_rgb = cv2.cvtColor(best_frame, cv2.COLOR_BGR2RGB)
-    display = frame_rgb.copy()
+    display   = frame_rgb.copy()
+
     for i, (x, y, w, h) in enumerate(best_detections):
-        color = PERSON_COLORS[i % len(PERSON_COLORS)]
+        color   = PERSON_COLORS[i % len(PERSON_COLORS)]
         r, g, b = color[2], color[1], color[0]
-        cv2.rectangle(display, (x, y), (x+w, y+h), (r, g, b), 3)
+        cv2.rectangle(display, (x, y), (x + w, y + h), (r, g, b), 3)
         lx, ly = max(0, x), max(40, y)
-        cv2.rectangle(display, (lx, ly-40), (lx+60, ly), (r, g, b), -1)
-        cv2.putText(display, f"#{i}", (lx+6, ly-8),
+        cv2.rectangle(display, (lx, ly - 40), (lx + 70, ly), (r, g, b), -1)
+        cv2.putText(display, f"#{i}", (lx + 6, ly - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
 
     h_img, w_img = display.shape[:2]
-    scale = 10.0 / max(w_img, h_img)   # ให้ด้านยาวสุดเป็น 10 นิ้ว
-    fig_w = w_img * scale
-    fig_h = h_img * scale
-
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    scale = 10.0 / max(w_img, h_img)
+    fig, ax = plt.subplots(figsize=(w_img * scale, h_img * scale))
     fig.patch.set_facecolor('#1a1a2e')
     ax.set_facecolor('#1a1a2e')
     ax.imshow(display)
     ax.set_title(
-        f'พบ {len(best_detections)} คน | t={best_frame_pos/video_fps:.1f}s  —  ดูหมายเลข แล้วใส่ PERSON_INDEX ใน Cell 3',
-        color='white', fontsize=11, pad=10
+        f'เฟรม #{best_frame_pos} (t={best_frame_pos/video_fps:.2f}s) | พบ {len(best_detections)} คน\n'
+        f'ดูหมายเลข → ใส่ PERSON_INDEX ใน Cell 3',
+        color='white', fontsize=11, pad=10,
     )
     ax.axis('off')
     plt.tight_layout()
     plt.savefig(save_path, dpi=100, bbox_inches='tight', facecolor='#1a1a2e')
     plt.show()
 
-    # บันทึก cx ของแต่ละคน (เรียงซ้าย→ขวา) เพื่อให้ create_person_clip init จากเฟรมเดียวกัน
+    # ── บันทึก cx + frame_pos → ใช้ใน extract_pose_from_video ──────
     preview_data = {
-        "frame_pos": int(best_frame_pos),
+        "frame_pos": int(best_frame_pos),       # ← เฟรมเดียวกับที่ tracker init
         "persons": [
-            {"cx": float(x + w/2), "cy": float(y + h/2),
+            {"cx": float(x + w / 2), "cy": float(y + h / 2),
              "w": float(w), "h": float(h)}
             for (x, y, w, h) in best_detections
-        ]
+        ],
     }
     data_path = os.path.join(os.path.dirname(save_path), "person_preview_data.json")
     with open(data_path, "w") as f:
         json.dump(preview_data, f)
 
-    print(f"\n→ ใส่ PERSON_INDEX = <หมายเลขที่เห็นในรูป> ใน Cell 3 แล้วรัน Cell 4c และ Cell 5")
+    print(f"\n→ ใส่ PERSON_INDEX = <หมายเลขที่เห็นในรูป> ใน Cell 3 แล้วรัน Cell 5")
     return 0
 
 
@@ -1006,7 +1031,45 @@ def extract_pose_from_video(
         dict ที่มี 'keypoints', 'timestamps', 'fps', 'video_info'
     """
     use_tracker = person_index is not None
-    tracker = PersonTracker(target_person_index=person_index) if use_tracker else None
+
+    # โหลด preview data (cx + frame_pos) เพื่อให้ tracker init ที่เฟรมเดียวกับ preview
+    target_cx        = None
+    preview_frame_pos = 0   # เฟรมที่ preview ใช้ → tracker จะเริ่ม init ที่นี่
+    if use_tracker:
+        preview_data_candidates = [
+            os.path.join(os.path.dirname(video_path), "person_preview_data.json"),
+            "results/person_preview_data.json",
+            "person_preview_data.json",
+        ]
+        for p in preview_data_candidates:
+            if os.path.exists(p):
+                try:
+                    import json as _json
+                    pd_data = _json.load(open(p))
+                    persons = pd_data.get("persons", [])
+                    preview_frame_pos = int(pd_data.get("frame_pos", 0))
+                    if person_index < len(persons):
+                        target_cx = float(persons[person_index]["cx"])
+                        print(f"  → preview data: เฟรม #{preview_frame_pos}, lock-on cx={target_cx:.0f}px (คน #{person_index})")
+                except Exception:
+                    pass
+                break
+        if target_cx is None:
+            print(f"  → ไม่พบ preview data — ใช้ index={person_index} ในเฟรมแรก")
+
+    tracker = PersonTracker(target_person_index=person_index, target_cx=target_cx) if use_tracker else None
+
+    # ── Init tracker ที่เฟรมเดียวกับ preview ──────────────────────────
+    # วิ่งผ่านเฟรมก่อน preview_frame_pos โดยไม่บันทึก เพื่อให้ tracker lock-on
+    # ที่ตำแหน่งเดียวกับที่แสดงในภาพ preview
+    _init_cap = cv2.VideoCapture(video_path)
+    if use_tracker and preview_frame_pos > 0 and _init_cap.isOpened():
+        _init_cap.set(cv2.CAP_PROP_POS_FRAMES, preview_frame_pos)
+        ret_init, frame_init = _init_cap.read()
+        if ret_init:
+            tracker.get_target_bbox(frame_init)   # init bbox จากเฟรมนี้
+            print(f"  → tracker init ที่เฟรม #{preview_frame_pos} แล้ว")
+    _init_cap.release()
 
     # โหลด pose model (Tasks API — รองรับ mediapipe 0.10+)
     model_path = _get_pose_model(os.path.dirname(os.path.abspath(__file__)))
@@ -1032,7 +1095,7 @@ def extract_pose_from_video(
 
     # ตรวจ rotation metadata
     duration = total_frames / video_fps if video_fps > 0 else 0
-    frame_interval = max(1, int(video_fps / sample_fps))
+    frame_interval = max(1, round(video_fps / sample_fps))
 
     if verbose:
         print(f"\nวิดีโอ: {os.path.basename(video_path)}")
@@ -1045,7 +1108,7 @@ def extract_pose_from_video(
         else:
             print(f"  โหมด: Single-person (MediaPipe เลือกเอง)")
 
-    keypoints_seq, timestamps, visibility_seq = [], [], []
+    keypoints_seq, timestamps, visibility_seq, raw_keypoints_seq = [], [], [], []
     frame_count = 0
 
     pbar = tqdm(total=total_frames // frame_interval, desc="Extracting poses") if verbose else None
@@ -1083,11 +1146,28 @@ def extract_pose_from_video(
                 kps = np.array([[lm[i].x, lm[i].y] for i in DANCE_KEYPOINTS], dtype=np.float32)
                 vis = np.array([getattr(lm[i], 'visibility', 1.0) for i in DANCE_KEYPOINTS], dtype=np.float32)
                 kps_norm = normalize_keypoints(kps)
+
+                # แปลง raw keypoints กลับเป็น full-frame 0-1 coordinates
+                if use_tracker and bbox is not None:
+                    x, y, w, h = bbox
+                    pad = int(max(w, h) * 0.15)
+                    x1 = max(0, x - pad); y1 = max(0, y - pad)
+                    x2 = min(width, x + w + pad); y2 = min(height, y + h + pad)
+                    crop_w, crop_h = x2 - x1, y2 - y1
+                    kps_raw = np.stack([
+                        (x1 + kps[:, 0] * crop_w) / width,
+                        (y1 + kps[:, 1] * crop_h) / height,
+                    ], axis=1).astype(np.float32)
+                else:
+                    kps_raw = kps.copy()  # already full-frame
+
                 keypoints_seq.append(kps_norm)
+                raw_keypoints_seq.append(kps_raw)
                 visibility_seq.append(vis)
                 timestamps.append(timestamp)
             else:
                 keypoints_seq.append(None)
+                raw_keypoints_seq.append(None)
                 visibility_seq.append(None)
                 timestamps.append(timestamp)
 
@@ -1102,10 +1182,11 @@ def extract_pose_from_video(
         pbar.close()
 
     # กรองเฉพาะ frame ที่ detect สำเร็จ
-    valid_idx = [i for i, kp in enumerate(keypoints_seq) if kp is not None]
-    valid_kps = [keypoints_seq[i] for i in valid_idx]
-    valid_ts = [timestamps[i] for i in valid_idx]
-    valid_vis = [visibility_seq[i] for i in valid_idx]
+    valid_idx  = [i for i, kp in enumerate(keypoints_seq) if kp is not None]
+    valid_kps  = [keypoints_seq[i] for i in valid_idx]
+    valid_raw  = [raw_keypoints_seq[i] for i in valid_idx]
+    valid_ts   = [timestamps[i] for i in valid_idx]
+    valid_vis  = [visibility_seq[i] for i in valid_idx]
 
     detection_rate = len(valid_idx) / max(len(keypoints_seq), 1) * 100
 
@@ -1116,6 +1197,7 @@ def extract_pose_from_video(
 
     return {
         "keypoints": valid_kps,
+        "raw_keypoints": valid_raw,
         "visibility": valid_vis,
         "timestamps": valid_ts,
         "fps": video_fps,
@@ -1161,24 +1243,41 @@ def load_pose_data(npz_path: str) -> dict:
     }
 
 
-def visualize_pose_on_frame(frame: np.ndarray, keypoints: np.ndarray, color=(0, 255, 0)) -> np.ndarray:
-    """วาด skeleton บน frame"""
+def visualize_pose_on_frame(
+    frame: np.ndarray,
+    keypoints: np.ndarray,
+    color=(0, 255, 0),
+    raw_keypoints: np.ndarray = None,
+) -> np.ndarray:
+    """
+    วาด skeleton บน frame
+    ถ้าส่ง raw_keypoints (0-1 full-frame) จะวาดตรงตำแหน่งคนจริงๆ
+    """
     h, w = frame.shape[:2]
     connections = [
         (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6),
         (1, 7), (2, 8), (7, 8), (7, 9), (8, 10), (9, 11), (10, 12),
     ]
-    center_x, center_y = w // 2, int(h * 0.6)
-    scale = w * 0.15
 
-    def to_pixel(kp):
-        return (int(center_x + kp[0] * scale), int(center_y + kp[1] * scale))
+    if raw_keypoints is not None:
+        # ใช้ตำแหน่งจริง
+        def to_pixel(kp):
+            return (max(0, min(w-1, int(kp[0] * w))),
+                    max(0, min(h-1, int(kp[1] * h))))
+        pts = raw_keypoints
+    else:
+        # fallback: วาดกึ่งกลาง
+        center_x, center_y = w // 2, int(h * 0.6)
+        scale = w * 0.15
+        def to_pixel(kp):
+            return (int(center_x + kp[0] * scale), int(center_y + kp[1] * scale))
+        pts = keypoints
 
     for i, j in connections:
-        if i < len(keypoints) and j < len(keypoints):
-            cv2.line(frame, to_pixel(keypoints[i]), to_pixel(keypoints[j]), color, 2, cv2.LINE_AA)
-    for kp in keypoints:
+        if i < len(pts) and j < len(pts):
+            cv2.line(frame, to_pixel(pts[i]), to_pixel(pts[j]), color, 2, cv2.LINE_AA)
+    for kp in pts:
         pt = to_pixel(kp)
-        cv2.circle(frame, pt, 4, color, -1, cv2.LINE_AA)
-        cv2.circle(frame, pt, 5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.circle(frame, pt, 5, color, -1, cv2.LINE_AA)
+        cv2.circle(frame, pt, 6, (255, 255, 255), 1, cv2.LINE_AA)
     return frame
